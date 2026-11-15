@@ -20,8 +20,11 @@
 | P2P 修正 | 开机时沿 NVIDIA GPU 的 sysfs 父级关系发现 PEX8796，清除其 ACS 控制位 |
 | 省电 | 主机运行 `nvidia-pstated`；空闲 GPU 可降到 P8，即使显存中仍分配了数据 |
 | 命令 | `/usr/local/bin/gpu-lab`，提供 `power`、`bench`、`ct` 子命令 |
+| CT | CT 100 `vllm` 正常运行，Ubuntu 26.04；四张 GPU 均可见 |
 
-配置主机时还没有创建 CT，因此 CT 子命令尚未针对某个具体容器实际运行。
+已在 CT 100 内验证 P2P 传输和 NCCL all-reduce：12 个 GPU 方向的数据校验均通过，P2P 约 6.57–6.67 GB/s；四卡 all-reduce 平均 bus bandwidth 约 5.15 GB/s。CT 内分配约 263 MiB 显存且不运行计算时，主机上的 GPU 仍回到 P8，功耗约 10–11 W。
+
+CT 首次启动失败是因为其 `rootfs` 配置含 `idmap=passthrough`，触发了 PVE pre-start hook 的 `EOVERFLOW`。已移除 rootfs 上这一项并保留 `/mnt/models` 挂载点的映射；部署命令会先备份配置，再单独询问是否修改 rootfs 映射。
 
 ## 自动部署
 
@@ -35,7 +38,7 @@
 在本地工作区根目录把两个文件复制到 PVE 主机后运行。下面用 `PVE_IP` 代表主机地址，请替换成实际地址：
 
 ```bash
-scp outputs/deploy-pve-gpu-lab.sh outputs/pve-nvidia-gpu-lab-redeployment.md root@PVE_IP:/root/
+scp outputs/deploy-pve-gpu-lab.sh outputs/README.md root@PVE_IP:/root/
 ssh root@PVE_IP
 cd /root
 chmod 0755 deploy-pve-gpu-lab.sh
@@ -66,7 +69,8 @@ CONFIRM=YES AUTO_REBOOT=1 bash deploy-pve-gpu-lab.sh
 
 6. 安装 `pex8796-gpu-p2p.service`，开机时动态查找 GPU 上游 PEX8796 并关闭 ACS 控制。无需在脚本或配置中维护 GPU 的 PCI 地址。
 7. 构建 NVIDIA 官方 `nvbandwidth` 和 `nccl-tests`，下载最新的 `nvidia-pstated` Linux x86_64 发布版，并启用其 systemd 服务。
-8. 安装 `gpu-lab` 命令。
+8. 构建显存保持测试程序，并安装 `gpu-lab` 命令。
+9. `gpu-lab ct` 会把 Ubuntu/Debian 的传统 `.list` 源和 deb822 `.sources` 源切换到 USTC；可为 Ubuntu 22.04/24.04/26.04 和 Debian 12/13 amd64 安装与主机驱动版本匹配的用户态库、CUDA runtime、NCCL，并在 CT 内测试 P2P 和显存保持下的 P8。
 
 ## 详细手动部署步骤
 
@@ -448,7 +452,7 @@ gpu-lab bench
 gpu-lab ct
 ```
 
-CT 子命令会交互询问 CT ID、GPU 索引、是否重启 CT、是否安装容器用户态工具。对 Debian 13 amd64 容器，它可用 `pct exec` 以 root 身份安装与主机驱动包版本相同的 NVIDIA 用户态驱动和 CUDA runtime，再在 CT 内测试 P2P 与空闲功耗。因为命令由 PVE 主机以 root 执行，不需要容器登录用户名或密码。功耗测试默认等待最多 15 分钟；输入 `n` 可跳过。
+CT 子命令会交互询问 CT ID、GPU 索引、是否重启 CT、是否替换 APT 源以及是否安装容器用户态工具。它支持 Ubuntu 22.04/24.04/26.04 和 Debian 12/13 amd64，可为旧 `.list` 和 deb822 `.sources` 格式备份并替换发行版归档源；NVIDIA 官方仓库仍保留官方地址。通过 `pct exec` 安装时使用容器 root，不需要容器登录用户名或密码。P2P 测试后可运行 36 秒显存保持测试，观察主机 P-state、功耗和显存占用。
 
 ## 日常使用
 
@@ -460,7 +464,7 @@ CT 子命令会交互询问 CT ID、GPU 索引、是否重启 CT、是否安装�
 gpu-lab power
 ```
 
-输出每张 GPU 的 P-state、功耗和显存占用。空闲状态应最终进入 `P8`。本机已观察到显存仍分配数据时，空闲 GPU 也能进入 P8，功耗约为每张 10–14 W。`nvidia-pstated` 默认可能需要一段空闲观察时间；通常应留出最多约 15 分钟再判断。
+命令会询问 GPU 索引、要保持的显存大小和测试时长，默认分配 128 MiB、运行 36 秒；期间每两秒采样 P-state、功耗、利用率和显存占用，并确认显存分配成功。空闲状态应最终进入 `P8`。本机在显存保持约 263 MiB 时观察到 GPU 回到 P8，功耗约为每张 10–11 W。`nvidia-pstated` 需要空闲观察时间，若尚未进入 P8，应延长等待并检查是否有其他 GPU 任务。
 
 ### 测量 P2P 和 NCCL
 
@@ -490,12 +494,65 @@ gpu-lab ct
 2. 显示当前主机 GPU 索引和型号，允许选择单卡、多卡或全部 GPU。
 3. 备份 CT 配置，动态映射 `/dev/nvidia*` 设备；重复运行时会替换脚本管理的 NVIDIA 设备映射。
 4. 对已停止的 CT 自动启动；对运行中的 CT 询问是否重启以应用设备映射。
-5. 可选地为 Debian 13 amd64 CT 安装与主机驱动包版本完全一致的 NVIDIA 用户态工具和 CUDA runtime。
-6. 在 CT 内执行 `nvidia-smi`、P2P 矩阵和 `nvbandwidth` 测试，并显示 CT 可见的 GPU 功耗状态。
+5. 将常见 Ubuntu/Debian APT 归档源切换到 USTC，涵盖 `.list` 和 `.sources` 两种格式，并在改动文件旁保存备份。
+6. 可选地为 Ubuntu 22.04/24.04/26.04 或 Debian 12/13 amd64 CT 安装与主机驱动版本匹配的 NVIDIA 用户态库、CUDA runtime 和 NCCL；不在 CT 内安装内核驱动。
+7. 在 CT 内执行 `nvidia-smi`、P2P 矩阵和 `nvbandwidth` 测试；通过在 CT 内保持显存分配，检查主机是否仍能让空闲 GPU 进入 P8。
 
 脚本通过 `pct exec` 以容器 root 身份运行安装命令，所以此流程不需要 CT 登录用户名或密码。其他发行版仍可配置设备映射，但用户态驱动需要按该容器发行版自行安装。
 
-P2P 性能测试期间，脚本会暂时停止主机的 `nvidia-pstated`；退出后会恢复。CT 子命令随后默认等待最多 15 分钟，让所选 GPU 保持空闲并采样主机和 CT 可见的 P-state/功耗；输入 `n` 可以跳过等待。功耗管理由主机上的 `nvidia-pstated` 执行，不是在 CT 内运行守护进程。测试期间如果有其他任务持续使用这些 GPU，状态可能不会降到 P8。
+P2P 性能测试期间，脚本会暂时停止主机的 `nvidia-pstated`；退出后会恢复。CT 显存保持测试会在主机侧观察所选 GPU 的状态，确认显存占用上升后继续采样；预期在没有活跃计算时回到 P8。功耗管理由主机上的 `nvidia-pstated` 执行，不是在 CT 内运行守护进程。测试期间如果有其他任务持续使用这些 GPU，状态可能不会降到 P8。
+
+### 手动切换 CT 软件源并安装 NVIDIA 用户态库
+
+先选定 CT 并转换它正在使用的 Debian/Ubuntu 源文件。命令会备份有改动的文件，支持 `/etc/apt/sources.list`、`*.list` 和 deb822 `*.sources`：
+
+```bash
+CT_ID=100
+pct exec "$CT_ID" -- sh -c '
+set -eu
+stamp=$(date +%Y%m%d-%H%M%S)
+for file in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+  [ -f "$file" ] || continue
+  if grep -Eiq "archive\\.ubuntu\\.com|security\\.ubuntu\\.com|ports\\.ubuntu\\.com|((deb|ftp|cdn-fastly)\\.)?debian\\.org|security\\.debian\\.org" "$file"; then
+    cp -a "$file" "$file.gpu-lab.$stamp.bak"
+    sed -E -i \\
+      -e "s#https?://([[:alnum:]-]+\\.)*(archive|security|ports)\\.ubuntu\\.com/ubuntu(-ports)?/?#https://mirrors.ustc.edu.cn/ubuntu#g" \\
+      -e "s#https?://security\\.debian\\.org(/debian-security)?/?#https://mirrors.ustc.edu.cn/debian-security#g" \\
+      -e "s#https?://((deb|ftp|cdn-fastly)\\.)?debian\\.org/debian-security/?#https://mirrors.ustc.edu.cn/debian-security#g" \\
+      -e "s#https?://((deb|ftp|cdn-fastly)\\.)?debian\\.org/debian/?#https://mirrors.ustc.edu.cn/debian#g" "$file"
+  fi
+done
+'
+pct exec "$CT_ID" -- apt-get update
+```
+
+如需在 CT 内手动安装用户态组件，按容器发行版选择 NVIDIA CUDA 仓库，然后安装与主机驱动版本前缀相同的 `libnvidia-compute`。Ubuntu 22.04/24.04/26.04 对应 `ubuntu2204`/`ubuntu2404`/`ubuntu2604`；Debian 12/13 对应 `debian12`/`debian13`：
+
+```bash
+CT_ID=100
+REPO=ubuntu2604                 # 按上表修改
+KEYRING="/tmp/cuda-keyring-ct-${CT_ID}.deb"
+curl -fL --retry 3 \
+  "https://developer.download.nvidia.com/compute/cuda/repos/$REPO/x86_64/cuda-keyring_1.1-1_all.deb" \
+  -o "$KEYRING"
+pct push "$CT_ID" "$KEYRING" /tmp/cuda-keyring.deb
+pct exec "$CT_ID" -- dpkg -i /tmp/cuda-keyring.deb
+pct exec "$CT_ID" -- sh -c "printf '%s\\n' 'deb [signed-by=/usr/share/keyrings/cuda-archive-keyring.gpg] https://developer.download.nvidia.com/compute/cuda/repos/$REPO/x86_64/ /' > /etc/apt/sources.list.d/cuda-$REPO-x86_64.list"
+pct exec "$CT_ID" -- apt-get -o APT::Update::Error-Mode=any update
+
+DRIVER="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -n1 | tr -d ' ')"
+BRANCH="${DRIVER%%.*}"
+PKG=libnvidia-compute
+PKG_VERSION="$(pct exec "$CT_ID" -- sh -c "apt-cache madison $PKG | awk '\$3 ~ /^${DRIVER}-/ {print \$3; exit}'" || true)"
+if [ -z "$PKG_VERSION" ]; then
+  PKG="libnvidia-compute-$BRANCH"
+  PKG_VERSION="$(pct exec "$CT_ID" -- sh -c "apt-cache madison $PKG | awk '\$3 ~ /^${DRIVER}-/ {print \$3; exit}'")"
+fi
+test -n "$PKG_VERSION"
+pct exec "$CT_ID" -- apt-get install -y "$PKG=$PKG_VERSION" cuda-cudart-13-5 libnccl2
+```
+
+这只安装 NVIDIA 用户态库、CUDA runtime 和 NCCL，不会在容器内安装内核驱动。完成后可运行 `pct exec "$CT_ID" -- nvidia-smi`、`pct exec "$CT_ID" -- nvidia-smi topo -p2p p`，再用 `gpu-lab ct` 执行带宽和显存保持功耗测试。
 
 ## 重启后的核对
 
@@ -523,8 +580,11 @@ gpu-lab bench
 
 ## 参考文档
 
+- [USTC Ubuntu 镜像配置](https://mirrors.ustc.edu.cn/help/ubuntu.html)
+- [USTC Debian 镜像配置](https://mirrors.ustc.edu.cn/help/debian.html)
 - [USTC Proxmox 镜像配置和 CT 模板镜像说明](https://mirrors.ustc.edu.cn/help/proxmox.html)
 - [USTC TurnKey 镜像及 PVE CT 模板配置说明](https://mirrors.ustc.edu.cn/help/turnkeylinux.html)
+- [NVIDIA CUDA Linux 安装指南（受支持的 Ubuntu/Debian 版本）](https://docs.nvidia.com/cuda/cuda-installation-guide-linux/)
 - [NVIDIA Debian 驱动安装指南](https://docs.nvidia.com/datacenter/tesla/driver-installation-guide/debian.html)
 - [NVIDIA NCCL GPU troubleshooting：P2P、IOMMU 和 ACS](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/troubleshooting/gpu_troubleshooting.html)
 - [NVIDIA nvbandwidth：构建、测试选项和数据验证](https://github.com/NVIDIA/nvbandwidth)

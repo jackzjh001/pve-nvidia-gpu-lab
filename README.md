@@ -1,30 +1,33 @@
 # PVE NVIDIA GPU 主机重部署说明
 
-本文记录这台主机当前验证过的 Proxmox VE、NVIDIA 驱动、GPU P2P、低功耗和 CT 配置，并附有一份自动部署脚本。
+本文记录这台主机重装后的 Proxmox VE、NVIDIA 驱动、GPU P2P、低功耗和 CT 部署配置，并附有一份自动部署脚本。
 
 配套脚本：[deploy-pve-gpu-lab.sh](./deploy-pve-gpu-lab.sh)
 
+CT100 的模型、磁盘布局、vLLM 构建和启动配置另见[完整恢复记录](./CT100-REDEPLOYMENT.md)。PVE 刚重装完，host 部署和 GPU 验证已完成；CT 尚未重建，因为当前 `local-lvm` 容量不足以容纳原定的 400 GiB KV cache、CT 系统盘和 vLLM runtime。
+
 ## 当前状态快照
 
-这些版本号是最近一次配置时观察到的状态。脚本会从 NVIDIA 仓库安装执行时可用的最新驱动，因此以后重新部署的版本可能更新。
+以下是 2026-11-20 PVE 重装后的实际状态。脚本会从 NVIDIA 仓库安装执行时可用的最新驱动。
 
 | 项目 | 已验证状态 |
 |---|---|
 | 系统 | Debian 13 `trixie`，Proxmox VE 9.2 |
-| 最近运行内核 | `7.0.14-28-pve` |
+| 最近运行内核 | `7.0.14-30-pve` |
 | GPU | 4 张 NVIDIA Tesla T10，每张 16 GB |
 | PCIe | GPU 具备 PCIe Gen3 x8 链路能力，连接到 Broadcom PEX8796 |
-| NVIDIA 驱动 | 最近观察到的驱动版本 `620.70.06-1`；当时仓库中的最新版本 |
-| CUDA / NCCL | CUDA nvcc 13.5、NCCL 运行库和开发包 |
+| NVIDIA 驱动 | `620.70.06-1`，NVIDIA 仓库当前最新候选；DKMS 模块已为运行内核构建 |
+| CUDA / NCCL | CUDA nvcc 13.5、NVML/NVAPI 开发与运行库、NCCL 2.32.6 |
 | 软件源 | Debian、PVE、可用的 Ceph 源和 CT 模板元数据切换到 USTC |
-| P2P 修正 | 开机时沿 NVIDIA GPU 的 sysfs 父级关系发现 PEX8796，清除其 ACS 控制位 |
-| 省电 | 主机运行 `nvidia-pstated`；空闲 GPU 可降到 P8，即使显存中仍分配了数据 |
+| P2P 修正 | `pex8796-gpu-p2p.service` 开机时沿 GPU 的 sysfs 父级关系发现 PEX8796，清除对应 ACS 控制位 |
+| 省电 | `nvidia-pstated` 正常运行；持有约 263 MiB 显存、无计算时 GPU0 回到 P8；四卡空闲均为 P8 |
 | 命令 | `/usr/local/bin/gpu-lab`，提供 `power`、`bench`、`ct` 子命令 |
-| CT | CT 100 `vllm` 正常运行，Ubuntu 26.04；四张 GPU 均可见 |
+| CT | PVE 重装后尚未重建；Ubuntu 26.04 模板已下载到 `local` |
+| 存储 | 模板在 `local`；CT 系统卷、vLLM、KV cache 预期在 `local-lvm`；`xg3` 仅用于模型和备份 |
 
-已在 CT 100 内验证 P2P 传输和 NCCL all-reduce：12 个 GPU 方向的数据校验均通过，P2P 约 6.57–6.67 GB/s；四卡 all-reduce 平均 bus bandwidth 约 5.15 GB/s。CT 内分配约 263 MiB 显存且不运行计算时，主机上的 GPU 仍回到 P8，功耗约 10–11 W。
+本次在 host 验证：`nvidia-smi topo -p2p p` 的所有 GPU 对均为 `OK`；nvbandwidth 的 GPU-to-GPU 单向 copy-engine 带宽约 6.57–6.67 GB/s，双向合计约 12.5 GB/s；SM 读/写约 6.67/5.53 GB/s。四卡 NCCL all-reduce 在 8 MiB–1 GiB 测试范围内完成，平均 bus bandwidth 5.45 GB/s，数据校验错误为 0。PCIe 测试期间服务会暂停，测试后已恢复；四卡空闲重新回到 P8。
 
-CT 首次启动失败是因为其 `rootfs` 配置含 `idmap=passthrough`，触发了 PVE pre-start hook 的 `EOVERFLOW`。已移除 rootfs 上这一项并保留 `/mnt/models` 挂载点的映射；部署命令会先备份配置，再单独询问是否修改 rootfs 映射。
+当前实测存储容量：`local-lvm` thin pool 约 293 GiB；CT rootfs 16 GiB、vLLM 80 GiB 和 KV cache 400 GiB 合计至少需要 496 GiB，不能安全分配。新 `xg3` 是独立 ext4 盘（挂载 `/mnt/pve/xg3`，约 466 GiB 可用），目前没有模型文件；已创建 `/mnt/pve/xg3/models` 并将 PVE 存储内容限制为 `backup`。不应通过 thin pool 超额分配伪造 400 GiB 上限，因为实际写满点会早于 KV 目录容量。
 
 ## 自动部署
 
@@ -60,7 +63,7 @@ CONFIRM=YES AUTO_REBOOT=1 bash deploy-pve-gpu-lab.sh
 1. 将 Debian、PVE no-subscription 和原先已配置的 Ceph 仓库切换到 USTC。
 2. 将 PVE 和 TurnKey CT 模板元数据地址替换为 USTC；并设置 `pve-daily-update.service` 的 drop-in，在更新 TurnKey 模板列表后改写其中的旧镜像 URL。
 3. 运行 `apt update`、`apt full-upgrade` 和 `apt autoremove --purge`。
-4. 添加 NVIDIA Debian 13 仓库，安装仓库当前版本的 `nvidia-driver-cuda`、`nvidia-kernel-open-dkms`、`nvidia-modprobe`、`cuda-nvcc-13-5` 和 NCCL 开发包。
+4. 添加 NVIDIA Debian 13 仓库，安装仓库当前版本的 `nvidia-driver-cuda`、`nvidia-kernel-open-dkms`、`nvidia-modprobe`、`libnvidia-api1`、`cuda-nvcc-13-5`、`cuda-nvml-dev-13-5` 和 NCCL 开发包。
 5. 屏蔽 nouveau，并写入下列启动参数：
 
    ```text
@@ -212,7 +215,7 @@ apt-get update
 
 DEBIAN_FRONTEND=noninteractive apt-get install -y \
   nvidia-driver-cuda nvidia-kernel-open-dkms nvidia-modprobe \
-  cuda-nvcc-13-5 libnccl2 libnccl-dev
+  libnvidia-api1 cuda-nvcc-13-5 cuda-nvml-dev-13-5 libnccl2 libnccl-dev
 
 apt-cache policy nvidia-driver-cuda nvidia-kernel-open-dkms
 dpkg-query -W -f='${Package} ${Version}\n' \
@@ -335,7 +338,7 @@ mkdir -p /usr/local/src
 
 git clone --depth 1 https://github.com/NVIDIA/nvbandwidth.git /usr/local/src/nvbandwidth
 cmake -S /usr/local/src/nvbandwidth -B /usr/local/src/nvbandwidth/build \
-  -DCMAKE_CUDA_ARCHITECTURES=native
+  -DCMAKE_CUDA_ARCHITECTURES=75
 cmake --build /usr/local/src/nvbandwidth/build --parallel "$(nproc)"
 NVBANDWIDTH_BIN="$(find /usr/local/src/nvbandwidth/build -type f -name nvbandwidth -print -quit)"
 test -n "$NVBANDWIDTH_BIN"
@@ -346,19 +349,21 @@ install -m 0755 "$NVBANDWIDTH_BIN" /usr/local/bin/nvbandwidth
 
 ```bash
 git clone --depth 1 https://github.com/NVIDIA/nccl-tests.git /usr/local/src/nccl-tests
-make -C /usr/local/src/nccl-tests -j"$(nproc)" CUDA_HOME="$CUDA_HOME" NCCL_HOME=/usr
+make -C /usr/local/src/nccl-tests -j"$(nproc)" CUDA_HOME="$CUDA_HOME" NCCL_HOME=/usr \
+  NVCC_GENCODE="-gencode=arch=compute_75,code=sm_75"
 ```
 
 如果 `/usr/local/src/nvbandwidth` 或 `/usr/local/src/nccl-tests` 已存在，就进入原目录执行 `git pull --ff-only`，再运行对应的构建命令。NVIDIA 官方构建说明见 [nvbandwidth](https://github.com/NVIDIA/nvbandwidth) 与 [nccl-tests](https://github.com/NVIDIA/nccl-tests)。
 
 ### 8. 安装 nvidia-pstated 并启用功耗管理
 
-下载 GitHub 最新版中 Linux x86_64 的发布资产：
+下载 GitHub 最新版发布的 Linux 二进制（当前资产名为 `nvidia-pstated`）：
 
 ```bash
 PSTATED_URL="$(curl -fsSL https://api.github.com/repos/sasha0552/nvidia-pstated/releases/latest |
-  jq -r '[.assets[] | select((.name | ascii_downcase | test("linux")) and
-    (.name | ascii_downcase | test("amd64|x86_64|x86-64")))] |
+  jq -r '[.assets[] | select(.name == "nvidia-pstated" or
+    ((.name | ascii_downcase | test("linux")) and
+    (.name | ascii_downcase | test("amd64|x86_64|x86-64"))))] |
     .[0].browser_download_url // empty')"
 test -n "$PSTATED_URL"
 PSTATED_TMP="$(mktemp -d)"
@@ -478,7 +483,7 @@ gpu-lab bench
 - `nvbandwidth` 的 GPU 间复制带宽和传输验证。
 - 所有可用 GPU 上的 NCCL all-reduce。
 
-已经验证过的结果：12 个 GPU 方向均可用，P2P 实测约 6.57–6.67 GB/s；四卡 all-reduce 成功，平均 bus bandwidth 约 5.17 GB/s。PCIe Gen3 x8 的编码后理论线速约 7.88 GB/s/方向，真实有效负载还会受到协议和实现开销影响；因此应结合 `nvbandwidth` 的实际输出判断链路，不能把理论线速当作必然测得的有效带宽。
+2026-11-20 重装后重新验证：四卡所有配对均可用，P2P copy-engine 单向读/写分别约 6.57/6.59 GB/s；四卡 all-reduce 平均 bus bandwidth 5.45 GB/s，数据校验错误为 0。负载运行时 `LnkSta` 为 PCIe 8 GT/s x8；GPU 空闲到 P8 时协商速率降至 2.5 GT/s x8，再做传输会升回 8 GT/s x8，所以空闲时看到 2.5 GT/s 不代表带宽测试也被锁在 Gen1。P2P 吞吐约为 Gen3 x8 编码后理论线速 7.88 GB/s 的 83%；拓扑矩阵全为 `PIX`、P2P 状态均 `OK`，这组实测没有显示 ACS 未关闭或 PCIe 降速问题。协议和复制实现仍会让有效负载低于线速。
 
 补充说明：Broadcom 标注 PEX8796 为 PCIe Gen3、8 GT/s；PCI-SIG 说明 Gen3 使用 128b/130b 编码，因此 x8 单方向编码后理论线速约 7.88 GB/s，尚未扣除协议开销。此前 6.57–6.67 GB/s 的结果表示 P2P 路径已经工作，但还没有达到该理论上限；要继续追峰值，应核对当前协商的链路宽度/速率，并看 `nvbandwidth` 的具体 GPU 对结果。[Broadcom PEX8796](https://www.broadcom.com/products/pcie-switches-retimers/pcie-switches/pex8796), [PCI-SIG PCIe 3.0 rate and encoding](https://pcisig.com/what-bit-rate-pcie-30-and-how-does-it-compare-prior-generations-pcie)
 

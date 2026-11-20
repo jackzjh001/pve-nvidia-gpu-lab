@@ -141,7 +141,7 @@ apt-get update
 log "Installing latest repository driver plus CUDA/NCCL test dependencies"
 DEBIAN_FRONTEND=noninteractive apt-get install -y \
   nvidia-driver-cuda nvidia-kernel-open-dkms nvidia-modprobe \
-  cuda-nvcc-13-5 libnccl2 libnccl-dev
+  libnvidia-api1 cuda-nvcc-13-5 cuda-nvml-dev-13-5 libnccl2 libnccl-dev
 
 log "Blocking nouveau and adding the requested GRUB kernel arguments"
 cat > /etc/modprobe.d/blacklist-nouveau.conf <<'EOF'
@@ -238,7 +238,7 @@ else
   git clone --depth 1 https://github.com/NVIDIA/nvbandwidth.git /usr/local/src/nvbandwidth
 fi
 cmake -S /usr/local/src/nvbandwidth -B /usr/local/src/nvbandwidth/build \
-  -DCMAKE_CUDA_ARCHITECTURES=native
+  -DCMAKE_CUDA_ARCHITECTURES=75
 cmake --build /usr/local/src/nvbandwidth/build --parallel "$(nproc)"
 NVBANDWIDTH_BIN="$(find /usr/local/src/nvbandwidth/build -type f -name nvbandwidth -print -quit)"
 [ -n "$NVBANDWIDTH_BIN" ] || die "nvbandwidth build did not produce an executable."
@@ -288,12 +288,14 @@ else
   rm -rf /usr/local/src/nccl-tests
   git clone --depth 1 https://github.com/NVIDIA/nccl-tests.git /usr/local/src/nccl-tests
 fi
-make -C /usr/local/src/nccl-tests -j"$(nproc)" CUDA_HOME="$CUDA_HOME" NCCL_HOME=/usr
+make -C /usr/local/src/nccl-tests -j"$(nproc)" CUDA_HOME="$CUDA_HOME" NCCL_HOME=/usr \
+  NVCC_GENCODE="-gencode=arch=compute_75,code=sm_75"
 
 log "Installing the latest nvidia-pstated Linux x86_64 release"
 PSTATED_URL="$(curl -fsSL https://api.github.com/repos/sasha0552/nvidia-pstated/releases/latest |
-  jq -r '[.assets[] | select((.name | ascii_downcase | test("linux")) and
-    (.name | ascii_downcase | test("amd64|x86_64|x86-64")))] |
+  jq -r '[.assets[] | select(.name == "nvidia-pstated" or
+    ((.name | ascii_downcase | test("linux")) and
+    (.name | ascii_downcase | test("amd64|x86_64|x86-64"))))] |
     .[0].browser_download_url // empty')"
 [ -n "$PSTATED_URL" ] || die "No Linux x86_64 nvidia-pstated release asset was found."
 PSTATED_TMP="$(mktemp -d)"

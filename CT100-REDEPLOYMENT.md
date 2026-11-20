@@ -20,7 +20,7 @@ CT100 为 Ubuntu 26.04、12 vCPU、40 GiB RAM、4 GiB swap，地址 `10.10.2.100
 
 KV 卷是 400 GiB；ext4 已扩展到整个卷，root 保留块设为 0%，`df` 显示约 393 GiB 可用，为 384 GiB 清理线留下约 9 GiB 余量。CT 的 `vllm-kv-cache-prune.timer` 每 15 秒统计磁盘 KV `.bin` 块，超过 384 GiB 时按最旧优先删除到 90% 水位（约 345.6 GiB）。这是独立清理器，不修改上游 vLLM 仓库。
 
-host 的 `/`、Samsung、Toshiba 与 CT 的 `/` 使用 `noatime`。CT `/mnt/vllm` 和 `/mnt/kv-cache` 使用 `noatime,discard`；`/mnt/models` 移除了 `noatime`、`discard` 两个参数，使用 ext4 默认 `relatime`。没有新增 TRIM 定时器或服务；保留系统自带的 host `fstrim.timer`（每周）。它扫描 host 可见的挂载点，覆盖 Samsung/Toshiba 文件系统；host 根盘不支持 discard，会被 `--quiet-unsupported` 跳过。CT 内的 Ubuntu `fstrim.service` 和 `fstrim.timer` 带有 `ConditionVirtualization=!container`，因此不会在容器里运行；CT raw 磁盘内部的 ext4 空闲块不会由 host 的常规 timer 自动 trim。需要时可在 host 手动执行 `pct fstrim 100`。此前手动 trim 曾让 KV raw 文件释放约 2.8 GiB 宿主机分配空间。
+host 的 `/`、Samsung、Toshiba 与 CT 的 `/`、`/mnt/models` 使用 `noatime`。CT `/mnt/vllm` 和 `/mnt/kv-cache` 使用 `noatime,discard`；`/mnt/models` 不启用 `discard`。没有新增 TRIM 定时器或服务；保留系统自带的 host `fstrim.timer`（每周）。它扫描 host 可见的挂载点，覆盖 Samsung/Toshiba 文件系统；host 根盘不支持 discard，会被 `--quiet-unsupported` 跳过。CT 内的 Ubuntu `fstrim.service` 和 `fstrim.timer` 带有 `ConditionVirtualization=!container`，因此不会在容器里运行；CT raw 磁盘内部的 ext4 空闲块不会由 host 的常规 timer 自动 trim。需要时可在 host 手动执行 `pct fstrim 100`。此前手动 trim 曾让 KV raw 文件释放约 2.8 GiB 宿主机分配空间。
 
 vLLM 由上游 [vLLM 2080 Ti Definitive](https://github.com/weicj/vLLM-2080Ti-Definitive/tree/93c9013e375b1ecbf2da88179d2a31175a0d5c99) 的 commit `93c9013e375b1ecbf2da88179d2a31175a0d5c99` 构建；未使用个人 fork，也未修改上游源码。运行时为 vLLM 0.2.2.post3、PyTorch 2.13.0+cu130、4×SM75；CUDA Toolkit 13.5.0 与 FlashQLA SM75 扩展已通过构建自检。
 
@@ -41,7 +41,7 @@ vLLM 由上游 [vLLM 2080 Ti Definitive](https://github.com/weicj/vLLM-2080Ti-De
 | 启动预设 | Qwen3.8-27B NVFP4 + DFlash2，max_model_len=200000；launcher KV 容量检查通过，3 × 200k tokens |
 | 磁盘 KV | 400 GiB 文件系统；独立定时清理器将 `.bin` KV 块限制在 384 GiB |
 | CT root SSH | 公钥、密码登录均启用；`PermitRootLogin yes`、`PasswordAuthentication yes`、`KbdInteractiveAuthentication no`；密码不写入仓库 |
-| ext4 挂载 | host ext4 与 CT rootfs 为 `noatime`；CT `/mnt/vllm`、`/mnt/kv-cache` 为 `noatime,discard`；`/mnt/models` 使用默认 `relatime` 且无 `discard`；只保留系统自带的 host 周度 `fstrim.timer` |
+| ext4 挂载 | host ext4、CT rootfs 与 `/mnt/models` 为 `noatime`；CT `/mnt/vllm`、`/mnt/kv-cache` 为 `noatime,discard`；只保留系统自带的 host 周度 `fstrim.timer` |
 
 ### 模型目录
 
@@ -278,7 +278,7 @@ ssh -i $Key root@10.10.2.100 'id -u; hostname'
 
 ### ext4 挂载参数与系统 TRIM 行为
 
-host 根文件系统、host 的 Samsung/Toshiba 文件系统和 CT rootfs 使用 `noatime`；它减少读取文件时的访问时间更新。CT `/mnt/vllm` 与 `/mnt/kv-cache` 额外启用了连续 `discard`，`/mnt/models` 上的 `noatime` 与 `discard` 两个参数均已移除，使用默认 `relatime`。系统自带的每周 host fstrim 仍保留，没有自定义 TRIM 服务或 timer。host 原生服务只扫描 host 的 `/etc/fstab` 和 `/proc/self/mountinfo`；CT raw 磁盘内部的空闲块不由 host timer 自动 trim，容器内的 fstrim 单元又因 `ConditionVirtualization=!container` 被跳过。需要时可由管理员手动运行 PVE 提供的 `pct fstrim 100`。
+host 根文件系统、host 的 Samsung/Toshiba 文件系统、CT rootfs 和 `/mnt/models` 使用 `noatime`；它减少读取文件时的访问时间更新。CT `/mnt/vllm` 与 `/mnt/kv-cache` 额外启用了连续 `discard`，`/mnt/models` 只设置 `noatime`。系统自带的每周 host fstrim 仍保留，没有自定义 TRIM 服务或 timer。host 原生服务只扫描 host 的 `/etc/fstab` 和 `/proc/self/mountinfo`；CT raw 磁盘内部的空闲块不由 host timer 自动 trim，容器内的 fstrim 单元又因 `ConditionVirtualization=!container` 被跳过。需要时可由管理员手动运行 PVE 提供的 `pct fstrim 100`。
 
 host 根盘不支持 discard；Samsung 和 Toshiba SSD 支持，且仍由 host 的周度 fstrim 使用。当前配置与安装命令如下（适用于本文记录的这台 PVE 主机）：
 
@@ -299,8 +299,8 @@ mount -o remount,noatime /mnt/pve/toshiba
 pct set 100 --rootfs local:100/vm-100-disk-0.raw,size=32G,mountoptions=noatime
 pct set 100 --mp0 'samsung:100/vm-100-disk-0.raw,mp=/mnt/vllm,backup=0,size=32G,mountoptions=noatime;discard'
 pct set 100 --mp1 'samsung:100/vm-100-disk-1.raw,mp=/mnt/kv-cache,backup=0,size=400G,mountoptions=noatime;discard'
-# models 卷不设置 mountoptions，保留 relatime 默认值且不启用 discard
-pct set 100 --mp2 toshiba:100/vm-100-disk-0.raw,mp=/mnt/models,backup=0,size=200G
+# models 卷只设置 noatime，不启用 discard
+pct set 100 --mp2 'toshiba:100/vm-100-disk-0.raw,mp=/mnt/models,backup=0,size=200G,mountoptions=noatime'
 pct shutdown 100 --timeout 60
 pct start 100
 

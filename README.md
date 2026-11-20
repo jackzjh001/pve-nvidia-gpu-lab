@@ -4,7 +4,7 @@
 
 配套脚本：[deploy-pve-gpu-lab.sh](./deploy-pve-gpu-lab.sh)
 
-CT100 的模型、磁盘布局、vLLM 构建和启动配置另见[完整恢复记录](./CT100-REDEPLOYMENT.md)。PVE host、CT100、GPU 映射、CUDA Toolkit 和上游 vLLM runtime 已重建；vLLM 服务保持停止，等待重新提供本地 NVFP4/FP8 主模型权重。
+CT100 的模型、磁盘布局、vLLM 构建和启动配置另见[完整恢复记录](./CT100-REDEPLOYMENT.md)。PVE host、CT100、GPU 映射、CUDA Toolkit 和上游 vLLM runtime 已重建；NVFP4/FP8/DFlash2 模型已恢复，启动 profile 的 Health、smoke、并发与图像验收均已完成，vLLM 服务随后停止。
 
 ## 当前状态快照
 
@@ -27,6 +27,8 @@ CT100 的模型、磁盘布局、vLLM 构建和启动配置另见[完整恢复�
 | vLLM | 上游 `vLLM-2080Ti-Definitive` 固定 commit 已构建；PyTorch 2.13.0+cu130，4×SM75，FlashQLA 扩展通过构建自检 |
 | 模型与服务 | NVFP4/FP8/DFlash2 均已在 CT `/mnt/models`；Health、smoke、三路并发和图片请求验证通过；API 验收后已停止 |
 | KV 清理 | CT 内 `vllm-kv-cache-prune.timer` 每 15 秒检查；超过 384 GiB 后按最旧 `.bin` 块回收到 90% 水位 |
+| 挂载与 TRIM | host 和 CT 的 ext4 均使用 `noatime`；host 每周 fstrim，CT100 由 host 的 `pve-ct100-fstrim.timer` 每周执行 `pct fstrim 100`；未启用持续 `discard` |
+| CT root SSH | 公钥与密码认证均开启；root 密码不保存在仓库或文档中 |
 
 本次在 host 验证：`nvidia-smi topo -p2p p` 的所有 GPU 对均为 `OK`；nvbandwidth 的 GPU-to-GPU 单向 copy-engine 带宽约 6.57–6.67 GB/s，双向合计约 12.5 GB/s；SM 读/写约 6.67/5.53 GB/s。四卡 NCCL all-reduce 在 8 MiB–1 GiB 测试范围内完成，平均 bus bandwidth 5.45 GB/s，数据校验错误为 0。PCIe 测试期间服务会暂停，测试后已恢复；四卡空闲重新回到 P8。
 

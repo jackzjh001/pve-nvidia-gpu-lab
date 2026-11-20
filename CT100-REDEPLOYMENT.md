@@ -8,7 +8,7 @@
 
 ## PVE 重装后的当前状态（2026-11-20）
 
-PVE host、CT100、GPU 映射、CUDA Toolkit 与上游 vLLM runtime 均已重建。P2P、NCCL、显存占用时回到 P8 的省电行为已在 host 和 CT 验证。NVFP4/FP8/DFlash2 模型均已在 CT `/mnt/models`；Health、smoke、三路并发与图像请求验收通过后，vLLM 服务已停止。
+PVE host、CT100、GPU 映射、CUDA Toolkit 与上游 vLLM runtime 均已重建。P2P、NCCL、显存占用时回到 P8 的省电行为已在 host 和 CT 验证。NVFP4/FP8/DFlash2 模型均已在 CT `/mnt/models`；启动 profile 完成 Health、smoke、三路并发和图像请求验收后，vLLM 服务已停止。
 
 | PVE 存储 | 当前实际配置 | 用途 |
 |---|---|---|
@@ -19,6 +19,8 @@ PVE host、CT100、GPU 映射、CUDA Toolkit 与上游 vLLM runtime 均已重建
 CT100 为 Ubuntu 26.04、12 vCPU、48 GiB RAM、8 GiB swap，地址 `10.10.2.100/16`，网关 `10.10.0.100`，已设为 host 开机自启。`gpu-lab ct` 通过当前 GPU 枚举映射四张 Tesla T10；配置不写死 PCI BDF。PVE host 没有 `local-lvm` thin pool，也没有 RAID。
 
 KV 卷是 400 GiB；ext4 已扩展到整个卷，root 保留块设为 0%，`df` 显示约 393 GiB 可用，为 384 GiB 清理线留下约 9 GiB 余量。CT 的 `vllm-kv-cache-prune.timer` 每 15 秒统计磁盘 KV `.bin` 块，超过 384 GiB 时按最旧优先删除到 90% 水位（约 345.6 GiB）。这是独立清理器，不修改上游 vLLM 仓库。
+
+host 的 `/`、Samsung、Toshiba 以及 CT 的 `/`、`/mnt/vllm`、`/mnt/kv-cache`、`/mnt/models` 均以 `noatime` 挂载。没有启用持续 `discard`：host 的 SSD 已由 `fstrim.timer` 每周 trim；CT 内的 Ubuntu fstrim 服务因容器条件不会运行，所以另设 host `pve-ct100-fstrim.timer` 每周调用 `pct fstrim 100`。首次 trim 释放了约 2.8 GiB 的 KV raw 文件宿主机分配空间；后续运行仍会安全检查并 trim 新释放的块。host 根盘是无 discard 能力的闪存设备，不配置 discard。
 
 vLLM 由上游 [vLLM 2080 Ti Definitive](https://github.com/weicj/vLLM-2080Ti-Definitive/tree/93c9013e375b1ecbf2da88179d2a31175a0d5c99) 的 commit `93c9013e375b1ecbf2da88179d2a31175a0d5c99` 构建；未使用个人 fork，也未修改上游源码。运行时为 vLLM 0.2.2.post3、PyTorch 2.13.0+cu130、4×SM75；CUDA Toolkit 13.5.0 与 FlashQLA SM75 扩展已通过构建自检。
 
@@ -38,7 +40,8 @@ vLLM 由上游 [vLLM 2080 Ti Definitive](https://github.com/weicj/vLLM-2080Ti-De
 | 服务端点 | 预设为 CT `10.10.2.100:8000` LAN；目前没有运行 API 服务 |
 | 启动预设 | Qwen3.8-27B NVFP4 + DFlash2，max_model_len=200000；launcher KV 容量检查通过，3 × 200k tokens |
 | 磁盘 KV | 400 GiB 文件系统；独立定时清理器将 `.bin` KV 块限制在 384 GiB |
-| CT root SSH | 已启用公钥登录；`PermitRootLogin prohibit-password`，不开放 root 密码登录 |
+| CT root SSH | 公钥、密码登录均启用；`PermitRootLogin yes`、`PasswordAuthentication yes`、`KbdInteractiveAuthentication no`；密码不写入仓库 |
+| ext4 挂载 | host 与 CT 的 ext4 均为 `noatime`；不启用连续 `discard`，host 每周 trim，CT100 通过 host 定时器每周 `pct fstrim 100` |
 
 ### 模型目录
 
@@ -80,9 +83,29 @@ NVFP4、FP8 模型权重不是 GitHub 仓库的一部分。两份本地模型现
     port/scope:         8000 / LAN
     mode:               fast
 
-此参数组合在重装前的完整模型运行中曾验证：`MAX_BATCHED_TOKENS=2048` 时 GPU KV 池为 670,491 tokens，启动器通过 3 × 200000 并发容量校验。当前因 NVFP4 主模型权重未恢复，尚未重新加载模型，因此新部署的 KV token 数、Harness 上报和推理表现仍待重新验证。上游文件系统 KV tier 本身不限制磁盘增长；独立清理器每 15 秒按 384 GiB 限值检查 `.bin` 块，超限后按最旧块回收到 90% 水位。
+此参数组合实测 GPU KV 池为 670,491 tokens，启动器通过 3 × 200000 并发容量校验；`/v1/models` 报告 `max_model_len=200000`，三路并发请求均成功。图像请求实际使用 3,003 个图像 tokens 并生成 256 个输出 tokens。验收完成后已停止 vLLM API。上游文件系统 KV tier 本身不限制磁盘增长；独立清理器每 15 秒按 384 GiB 限值检查 `.bin` 块，超限后按最旧块回收到 90% 水位。
 
-图像输入在服务预设中已启用，限制为每次请求最多 4 张图；此前的旧部署有成功图像请求记录。DFlash2 draft 不接收目标模型的外部多模态 embedding，所以图片由目标模型处理，草稿侧使用 text-only 输入。待主模型恢复后还需重新验证图片请求、200k 上下文与三路并发。
+图像输入在服务预设中已启用，限制为每次请求最多 4 张图。DFlash2 draft 不接收目标模型的外部多模态 embedding，所以图片由目标模型处理，草稿侧使用 text-only 输入。
+
+### Profile 字段说明
+
+`nvfp4-dflash2-200k-3-image.env` 是上游 launcher 的 route profile，只保留 launcher 白名单内的路由和推理字段：
+
+| 字段 | 当前值 | 作用 |
+|---|---|---|
+| `MODEL_FAMILY` | `qwen35` | 选择 Qwen 3.5 系列的模型路由规则 |
+| `MODEL_VARIANT` | `nvfp4` | 选择 NVFP4 主模型变体 |
+| `QUANTIZATION` | `compressed-tensors` | 告诉 vLLM 使用 compressed-tensors 量化格式 |
+| `KV_CACHE_DTYPE` | `fp8` | 将 GPU KV cache 存为 FP8，降低其显存占用 |
+| `MAX_MODEL_LEN` | `200000` | 每个请求的最大上下文 token 数 |
+| `GPU_UTIL` | `0.96` | vLLM 的 GPU 显存利用率目标 |
+| `MAX_BATCHED_TOKENS` | `2048` | 单次调度批次的 token 上限 |
+| `MAX_NUM_SEQS` | `3` | 最多并行调度 3 个请求序列 |
+| `SPECULATIVE_METHOD` | `dflash` | 启用 DFlash speculative decoding |
+| `SPECULATIVE_TOKENS` | `7` | 每轮由 draft 提议 7 个 token |
+| `MESSAGE_TYPE` | `text+image` | 允许文本和图像消息输入 |
+
+模型路径、draft 路径、服务名、TP/GPU 索引、磁盘 KV 目录、CPU staging、图片数量、端口和 LAN 绑定属于运行环境参数，不写进 route profile，而在启动时通过 `--set KEY=VALUE` 传入：`MODEL_DIR=/mnt/models/preetpatel/Qwen3.8-27B-Uncensored-NVFP4`、`SPECULATIVE_MODEL=/mnt/models/preetpatel/Qwen3.8-27B-DFlash2`、`SERVED_NAME=Qwen3.8-27B`、`TP_SIZE=4`、`GPU_DEVICES=0,1,2,3`、`KV_DISK_CACHE_DIR=/mnt/kv-cache`、`KV_DISK_CPU_BYTES=8589934592`、`MM_IMAGE_LIMIT=4`、`SERVICE_SCOPE=lan`、`PORT=8000`。图片限制被 launcher 转成 `MM_LIMIT_JSON={"image":4,"video":0,"audio":0}`。此前曾把这些运行环境字段混放进 route profile；该 launcher 会拒绝白名单之外的 key，因此现已拆分并从 profile 移除，启动命令单独提供这些值。
 
 ## 2. PVE 重装之前：复制数据到外部备份
 
@@ -200,9 +223,33 @@ pct exec 100 -- nvidia-smi
 
 本次 Toolkit 为 13.5.0-1；上游 vLLM runtime 使用 CUDA 13.0 / PyTorch 2.13.0+cu130。Toolkit 13.5 提供本机编译器；构建脚本自检确认四张 GPU 的 capability 都是 7.5。
 
-### 打开 CT root 的 SSH 公钥登录
+### 打开 CT root 的 SSH 公钥与密码登录
 
-CT 的 `sshd` 允许 root 使用公钥登录（`PermitRootLogin prohibit-password`），不开放 root 密码登录。私钥只保存在工作站，不放进 Git 仓库。重装后可重新创建密钥并把公钥放入 CT：
+当前 CT 同时允许 root 公钥与密码登录。配置文件 `/etc/ssh/sshd_config.d/99-ct-root-password.conf` 内容如下；`KbdInteractiveAuthentication no` 保持键盘交互式认证关闭，密码认证由 `PasswordAuthentication yes` 提供。私钥和 root 密码都不要放入 Git 仓库：
+
+~~~text
+PermitRootLogin yes
+PasswordAuthentication yes
+KbdInteractiveAuthentication no
+~~~
+
+在 CT 内创建/修改配置，并交互式设置 root 密码：
+
+~~~bash
+cat > /etc/ssh/sshd_config.d/99-ct-root-password.conf <<'EOF'
+PermitRootLogin yes
+PasswordAuthentication yes
+KbdInteractiveAuthentication no
+EOF
+passwd root
+sshd -t
+systemctl reload ssh
+sshd -T | grep -E '^(permitrootlogin|passwordauthentication|kbdinteractiveauthentication) '
+~~~
+
+`passwd root` 会交互提示两次，不要把密码作为命令行参数或写进脚本。检查 `passwd -S root` 状态为 `P`，并从另一台机器通过密码认证实际登录一次。
+
+如果只需要公钥登录，可改回 `PermitRootLogin prohibit-password`、`PasswordAuthentication no`，然后执行 `sshd -t && systemctl reload ssh`。私钥只保存在工作站，不放进 Git 仓库。重装后可重新创建密钥并把公钥放入 CT：
 
 在 Windows PowerShell：
 
@@ -228,6 +275,79 @@ Windows 工作站验证 root SSH：
 ~~~powershell
 ssh -i $Key root@10.10.2.100 'id -u; hostname'
 ~~~
+
+### ext4 挂载参数与 CT 定期 TRIM
+
+当前将 host 根文件系统、host 的 Samsung/Toshiba 文件系统，以及 CT rootfs 和三个 ext4 数据卷都设为 `noatime`。它避免每次读取文件都写访问时间，模型权重与 KV 文件这类读密集工作负载可少一些元数据写入。未启用连续 `discard`：它会把 discard 操作放进日常文件删除/释放路径，可能增加写入延迟；每周 fstrim 通常已足够。host 自带的 `fstrim.timer` 管理 host 文件系统，但 CT 内的 Ubuntu 定时器被容器运行条件跳过，所以由 host 增加 `pve-ct100-fstrim.timer`，每周调用一次 `pct fstrim 100`。CT 停止时 helper 安全跳过。
+
+host 根盘不支持 discard；Samsung 和 Toshiba SSD 支持，且仍由 host 的周度 fstrim 使用。当前配置与安装命令如下（适用于本文记录的这台 PVE 主机）：
+
+~~~bash
+# root 文件系统：fstab 加 noatime 并立即重挂载
+sed -i 's#^/dev/pve/root / ext4 errors=remount-ro 0 1$#/dev/pve/root / ext4 errors=remount-ro,noatime 0 1#' /etc/fstab
+mount -o remount,noatime /
+
+# systemd 管理的 Samsung/Toshiba mount 单元使用 drop-in，不改 PVE 原始 unit
+mkdir -p /etc/systemd/system/mnt-pve-samsung.mount.d /etc/systemd/system/mnt-pve-toshiba.mount.d
+printf '[Mount]\nOptions=defaults,noatime\n' > /etc/systemd/system/mnt-pve-samsung.mount.d/override.conf
+printf '[Mount]\nOptions=defaults,noatime\n' > /etc/systemd/system/mnt-pve-toshiba.mount.d/override.conf
+systemctl daemon-reload
+mount -o remount,noatime /mnt/pve/samsung
+mount -o remount,noatime /mnt/pve/toshiba
+
+# PVE CT rootfs 与 mpX 均用 mountoptions 保存；停止/启动 CT 以重新挂载生效
+pct set 100 --rootfs local:100/vm-100-disk-0.raw,size=32G,mountoptions=noatime
+pct set 100 --mp0 samsung:100/vm-100-disk-0.raw,mp=/mnt/vllm,backup=0,size=32G,mountoptions=noatime
+pct set 100 --mp1 samsung:100/vm-100-disk-1.raw,mp=/mnt/kv-cache,backup=0,size=400G,mountoptions=noatime
+pct set 100 --mp2 toshiba:100/vm-100-disk-0.raw,mp=/mnt/models,backup=0,size=200G,mountoptions=noatime
+pct shutdown 100 --timeout 60
+pct start 100
+
+# host timer 定期 trim CT 的 rootfs 和挂载卷；执行一次可立即检查
+cat > /usr/local/sbin/pve-ct100-fstrim <<'EOF'
+#!/bin/sh
+set -eu
+if /usr/sbin/pct status 100 | /usr/bin/grep -qx 'status: running'; then
+    exec /usr/sbin/pct fstrim 100
+fi
+/usr/bin/logger -t pve-ct100-fstrim 'CT 100 is stopped; skipping weekly trim'
+EOF
+chmod 0755 /usr/local/sbin/pve-ct100-fstrim
+cat > /etc/systemd/system/pve-ct100-fstrim.service <<'EOF'
+[Unit]
+Description=Trim CT 100 rootfs and mounted volumes
+After=pve-guests.service
+RequiresMountsFor=/mnt/pve/samsung /mnt/pve/toshiba
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/pve-ct100-fstrim
+Nice=19
+IOSchedulingClass=idle
+EOF
+cat > /etc/systemd/system/pve-ct100-fstrim.timer <<'EOF'
+[Unit]
+Description=Weekly TRIM for CT 100 sparse volumes
+
+[Timer]
+OnCalendar=weekly
+Persistent=true
+RandomizedDelaySec=30m
+Unit=pve-ct100-fstrim.service
+
+[Install]
+WantedBy=timers.target
+EOF
+systemctl daemon-reload
+systemctl enable --now pve-ct100-fstrim.timer
+systemctl start pve-ct100-fstrim.service
+
+# verify noatime on the host and inside CT
+findmnt -no SOURCE,FSTYPE,OPTIONS / /mnt/pve/samsung /mnt/pve/toshiba
+pct exec 100 -- findmnt -no SOURCE,FSTYPE,OPTIONS / /mnt/vllm /mnt/kv-cache /mnt/models
+~~~
+
+`pct fstrim 100` 会把 guest/CT 已释放的块通知到底层文件系统。首次运行从 `/mnt/kv-cache` 对应的 raw 文件释放了约 2.8 GiB 宿主机分配空间；后续若没有新增删除数据，trim 报告 0 B 也是正常结果。Debian [`fstrim(8)` 手册](https://manpages.debian.org/trixie/util-linux/fstrim.8.en.html)说明周度 trim 通常足够，并指出频繁 discard 可能有性能与设备寿命代价。
 
 ### 从工作站直接上传模型到 CT
 

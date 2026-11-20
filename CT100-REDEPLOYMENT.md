@@ -20,7 +20,7 @@ CT100 为 Ubuntu 26.04、12 vCPU、48 GiB RAM、8 GiB swap，地址 `10.10.2.100
 
 KV 卷是 400 GiB；ext4 已扩展到整个卷，root 保留块设为 0%，`df` 显示约 393 GiB 可用，为 384 GiB 清理线留下约 9 GiB 余量。CT 的 `vllm-kv-cache-prune.timer` 每 15 秒统计磁盘 KV `.bin` 块，超过 384 GiB 时按最旧优先删除到 90% 水位（约 345.6 GiB）。这是独立清理器，不修改上游 vLLM 仓库。
 
-host 的 `/`、Samsung、Toshiba 以及 CT 的 `/`、`/mnt/vllm`、`/mnt/kv-cache`、`/mnt/models` 均以 `noatime` 挂载。没有启用持续 `discard`：host 的 SSD 已由 `fstrim.timer` 每周 trim；CT 内的 Ubuntu fstrim 服务因容器条件不会运行，所以另设 host `pve-ct100-fstrim.timer` 每周调用 `pct fstrim 100`。首次 trim 释放了约 2.8 GiB 的 KV raw 文件宿主机分配空间；后续运行仍会安全检查并 trim 新释放的块。host 根盘是无 discard 能力的闪存设备，不配置 discard。
+host 的 `/`、Samsung、Toshiba 以及 CT 的 `/`、`/mnt/vllm`、`/mnt/kv-cache`、`/mnt/models` 均以 `noatime` 挂载。没有启用持续 `discard`，也没有新增 TRIM 定时器或服务；保留系统自带的 host `fstrim.timer`（每周）。它扫描 host 可见的挂载点，覆盖 Samsung/Toshiba 文件系统；host 根盘不支持 discard，会被 `--quiet-unsupported` 跳过。CT 内的 Ubuntu `fstrim.service` 和 `fstrim.timer` 带有 `ConditionVirtualization=!container`，因此不会在容器里运行；CT raw 磁盘内部的 ext4 空闲块不会由 host 的常规 timer 自动 trim。需要时可在 host 手动执行 `pct fstrim 100`。此前手动 trim 曾让 KV raw 文件释放约 2.8 GiB 宿主机分配空间。
 
 vLLM 由上游 [vLLM 2080 Ti Definitive](https://github.com/weicj/vLLM-2080Ti-Definitive/tree/93c9013e375b1ecbf2da88179d2a31175a0d5c99) 的 commit `93c9013e375b1ecbf2da88179d2a31175a0d5c99` 构建；未使用个人 fork，也未修改上游源码。运行时为 vLLM 0.2.2.post3、PyTorch 2.13.0+cu130、4×SM75；CUDA Toolkit 13.5.0 与 FlashQLA SM75 扩展已通过构建自检。
 
@@ -41,7 +41,7 @@ vLLM 由上游 [vLLM 2080 Ti Definitive](https://github.com/weicj/vLLM-2080Ti-De
 | 启动预设 | Qwen3.8-27B NVFP4 + DFlash2，max_model_len=200000；launcher KV 容量检查通过，3 × 200k tokens |
 | 磁盘 KV | 400 GiB 文件系统；独立定时清理器将 `.bin` KV 块限制在 384 GiB |
 | CT root SSH | 公钥、密码登录均启用；`PermitRootLogin yes`、`PasswordAuthentication yes`、`KbdInteractiveAuthentication no`；密码不写入仓库 |
-| ext4 挂载 | host 与 CT 的 ext4 均为 `noatime`；不启用连续 `discard`，host 每周 trim，CT100 通过 host 定时器每周 `pct fstrim 100` |
+| ext4 挂载 | host 与 CT 的 ext4 均为 `noatime`；不启用连续 `discard`；仅使用系统自带的 host 周度 `fstrim.timer`，CT 内部文件系统没有自动 trim |
 
 ### 模型目录
 
@@ -276,9 +276,9 @@ Windows 工作站验证 root SSH：
 ssh -i $Key root@10.10.2.100 'id -u; hostname'
 ~~~
 
-### ext4 挂载参数与 CT 定期 TRIM
+### ext4 挂载参数与系统 TRIM 行为
 
-当前将 host 根文件系统、host 的 Samsung/Toshiba 文件系统，以及 CT rootfs 和三个 ext4 数据卷都设为 `noatime`。它避免每次读取文件都写访问时间，模型权重与 KV 文件这类读密集工作负载可少一些元数据写入。未启用连续 `discard`：它会把 discard 操作放进日常文件删除/释放路径，可能增加写入延迟；每周 fstrim 通常已足够。host 自带的 `fstrim.timer` 管理 host 文件系统，但 CT 内的 Ubuntu 定时器被容器运行条件跳过，所以由 host 增加 `pve-ct100-fstrim.timer`，每周调用一次 `pct fstrim 100`。CT 停止时 helper 安全跳过。
+当前将 host 根文件系统、host 的 Samsung/Toshiba 文件系统，以及 CT rootfs 和三个 ext4 数据卷都设为 `noatime`。它避免每次读取文件都写访问时间，模型权重与 KV 文件这类读密集工作负载可少一些元数据写入。未启用连续 `discard`：它会把 discard 操作放进日常文件删除/释放路径，可能增加写入延迟；系统自带的每周 host fstrim 仍保留。没有自定义 TRIM 服务或 timer。host 的原生服务只扫描 host 的 `/etc/fstab` 和 `/proc/self/mountinfo`；CT 内部 ext4 卷不是 host namespace 的独立挂载点。Ubuntu 容器内的 fstrim 单元又因 `ConditionVirtualization=!container` 被跳过，因此 CT 内部卷默认不会自动 trim。需要释放 raw CT 卷中 guest 已删除数据对应的宿主机空间时，可由管理员手动运行 PVE 提供的 `pct fstrim 100`。
 
 host 根盘不支持 discard；Samsung 和 Toshiba SSD 支持，且仍由 host 的周度 fstrim 使用。当前配置与安装命令如下（适用于本文记录的这台 PVE 主机）：
 
@@ -303,44 +303,13 @@ pct set 100 --mp2 toshiba:100/vm-100-disk-0.raw,mp=/mnt/models,backup=0,size=200
 pct shutdown 100 --timeout 60
 pct start 100
 
-# host timer 定期 trim CT 的 rootfs 和挂载卷；执行一次可立即检查
-cat > /usr/local/sbin/pve-ct100-fstrim <<'EOF'
-#!/bin/sh
-set -eu
-if /usr/sbin/pct status 100 | /usr/bin/grep -qx 'status: running'; then
-    exec /usr/sbin/pct fstrim 100
-fi
-/usr/bin/logger -t pve-ct100-fstrim 'CT 100 is stopped; skipping weekly trim'
-EOF
-chmod 0755 /usr/local/sbin/pve-ct100-fstrim
-cat > /etc/systemd/system/pve-ct100-fstrim.service <<'EOF'
-[Unit]
-Description=Trim CT 100 rootfs and mounted volumes
-After=pve-guests.service
-RequiresMountsFor=/mnt/pve/samsung /mnt/pve/toshiba
+# PVE 原生的 host timer 仍然启用；不新增 CT timer 或 service
+systemctl is-enabled fstrim.timer
+systemctl is-active fstrim.timer
+systemctl cat fstrim.service
 
-[Service]
-Type=oneshot
-ExecStart=/usr/local/sbin/pve-ct100-fstrim
-Nice=19
-IOSchedulingClass=idle
-EOF
-cat > /etc/systemd/system/pve-ct100-fstrim.timer <<'EOF'
-[Unit]
-Description=Weekly TRIM for CT 100 sparse volumes
-
-[Timer]
-OnCalendar=weekly
-Persistent=true
-RandomizedDelaySec=30m
-Unit=pve-ct100-fstrim.service
-
-[Install]
-WantedBy=timers.target
-EOF
-systemctl daemon-reload
-systemctl enable --now pve-ct100-fstrim.timer
-systemctl start pve-ct100-fstrim.service
+# 按需手动 trim CT 的 rootfs 和挂载卷（不会定时自动执行）
+pct fstrim 100
 
 # verify noatime on the host and inside CT
 findmnt -no SOURCE,FSTYPE,OPTIONS / /mnt/pve/samsung /mnt/pve/toshiba

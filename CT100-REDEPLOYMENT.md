@@ -8,7 +8,7 @@
 
 ## PVE 重装后的当前状态（2026-11-20）
 
-PVE host、CT100、GPU 映射、CUDA Toolkit 与上游 vLLM runtime 均已重建。P2P、NCCL、显存占用时回到 P8 的省电行为已在 host 和 CT 验证。vLLM 服务保持停止，因为重新安装后 Toshiba models 卷里没有用户上传的 NVFP4/FP8 主模型权重。
+PVE host、CT100、GPU 映射、CUDA Toolkit 与上游 vLLM runtime 均已重建。P2P、NCCL、显存占用时回到 P8 的省电行为已在 host 和 CT 验证。NVFP4/FP8/DFlash2 模型均已在 CT `/mnt/models`；Health、smoke、三路并发与图像请求验收通过后，vLLM 服务已停止。
 
 | PVE 存储 | 当前实际配置 | 用途 |
 |---|---|---|
@@ -36,8 +36,9 @@ vLLM 由上游 [vLLM 2080 Ti Definitive](https://github.com/weicj/vLLM-2080Ti-De
 | NVIDIA/CUDA | host driver 620.70.06-1；CT `cuda-toolkit-13-5` 13.5.0-1，nvcc 13.5 |
 | vLLM runtime | 上游 vLLM 0.2.2.post3；PyTorch 2.13.0+cu130；CUDA runtime 13.0；4 GPU TP4 构建自检通过 |
 | 服务端点 | 预设为 CT `10.10.2.100:8000` LAN；目前没有运行 API 服务 |
-| 启动预设 | Qwen3.8-27B NVFP4 + DFlash2，max_model_len=200000；配置已写入但主模型文件缺失 |
+| 启动预设 | Qwen3.8-27B NVFP4 + DFlash2，max_model_len=200000；launcher KV 容量检查通过，3 × 200k tokens |
 | 磁盘 KV | 400 GiB 文件系统；独立定时清理器将 `.bin` KV 块限制在 384 GiB |
+| CT root SSH | 已启用公钥登录；`PermitRootLogin prohibit-password`，不开放 root 密码登录 |
 
 ### 模型目录
 
@@ -45,7 +46,7 @@ vLLM 由上游 [vLLM 2080 Ti Definitive](https://github.com/weicj/vLLM-2080Ti-De
     /mnt/models/orcarouter/Qwen3.8-27B-Uncensored-FP8   # 本地上传，FP8，约 29 GiB
     /mnt/models/preetpatel/Qwen3.8-27B-DFlash2          # ModelScope incoai/Qwen3.8-27B-DFlash2，约 3.6 GiB
 
-NVFP4、FP8 模型权重不是 GitHub 仓库的一部分。当前 DFlash2 已下载到 `/mnt/models/preetpatel/Qwen3.8-27B-DFlash2`（`model.safetensors` 约 3.59 GiB）；NVFP4 与 FP8 主模型目录在新系统上缺失，需要从原备份恢复或重新上传。
+NVFP4、FP8 模型权重不是 GitHub 仓库的一部分。两份本地模型现已上传到 CT 的 `/mnt/models`，DFlash2 位于 `/mnt/models/preetpatel/Qwen3.8-27B-DFlash2`（`model.safetensors` 约 3.59 GiB）。上传后核对了两份主模型每个文件的大小与源目录一致。
 
 ### 已准备的服务配置（API 当前停止）
 
@@ -199,6 +200,57 @@ pct exec 100 -- nvidia-smi
 
 本次 Toolkit 为 13.5.0-1；上游 vLLM runtime 使用 CUDA 13.0 / PyTorch 2.13.0+cu130。Toolkit 13.5 提供本机编译器；构建脚本自检确认四张 GPU 的 capability 都是 7.5。
 
+### 打开 CT root 的 SSH 公钥登录
+
+CT 的 `sshd` 允许 root 使用公钥登录（`PermitRootLogin prohibit-password`），不开放 root 密码登录。私钥只保存在工作站，不放进 Git 仓库。重装后可重新创建密钥并把公钥放入 CT：
+
+在 Windows PowerShell：
+
+~~~powershell
+$Key = Join-Path $env:USERPROFILE '.ssh\ct100-upload-ed25519'
+ssh-keygen -t ed25519 -a 100 -f $Key -C ct100-upload
+ssh root@PVE_IP 'install -d -m 700 /root/model-upload'
+scp "$Key.pub" root@PVE_IP:/root/model-upload/ct100-upload-ed25519.pub
+~~~
+
+在 PVE host：
+
+~~~bash
+pct exec 100 -- systemctl enable --now ssh
+pct exec 100 -- install -d -m 700 /root/.ssh
+pct push 100 /root/model-upload/ct100-upload-ed25519.pub /root/ct100-upload.pub
+pct exec 100 -- sh -c 'cat /root/ct100-upload.pub >> /root/.ssh/authorized_keys; chown root:root /root/.ssh /root/.ssh/authorized_keys; chmod 700 /root/.ssh; chmod 600 /root/.ssh/authorized_keys; rm -f /root/ct100-upload.pub'
+pct exec 100 -- sshd -T | grep -E '^(permitrootlogin|pubkeyauthentication) '
+~~~
+
+Windows 工作站验证 root SSH：
+
+~~~powershell
+ssh -i $Key root@10.10.2.100 'id -u; hostname'
+~~~
+
+### 从工作站直接上传模型到 CT
+
+模型盘挂载在 CT 的 `/mnt/models`。下面的 PowerShell 命令只传模型目录顶层文件，不重复传 Hugging Face `.cache`；先传入同一文件系统的临时目录，核对后再移动到正式目录：
+
+~~~powershell
+$Key = Join-Path $env:USERPROFILE '.ssh\ct100-upload-ed25519'
+$NVFP4 = 'D:\LLM\preetpatel\Qwen3.8-27B-Uncensored-NVFP4'
+$FP8 = 'D:\LLM\orcarouter\Qwen3.8-27B-Uncensored-FP8'
+ssh -i $Key root@10.10.2.100 'mkdir -p /mnt/models/.incoming/preetpatel/Qwen3.8-27B-Uncensored-NVFP4 /mnt/models/.incoming/orcarouter/Qwen3.8-27B-Uncensored-FP8'
+$NVFiles = Get-ChildItem -LiteralPath $NVFP4 -Force -File | ForEach-Object FullName
+$FPFiles = Get-ChildItem -LiteralPath $FP8 -Force -File | ForEach-Object FullName
+scp -i $Key @NVFiles root@10.10.2.100:/mnt/models/.incoming/preetpatel/Qwen3.8-27B-Uncensored-NVFP4/
+scp -i $Key @FPFiles root@10.10.2.100:/mnt/models/.incoming/orcarouter/Qwen3.8-27B-Uncensored-FP8/
+~~~
+
+文件数与源目录一致后，在 CT 完成同文件系统内移动：
+
+~~~powershell
+$Key = Join-Path $env:USERPROFILE '.ssh\ct100-upload-ed25519'
+ssh -i $Key root@10.10.2.100 'set -e; mkdir -p /mnt/models/orcarouter; test ! -e /mnt/models/preetpatel/Qwen3.8-27B-Uncensored-NVFP4; test ! -e /mnt/models/orcarouter/Qwen3.8-27B-Uncensored-FP8; mv /mnt/models/.incoming/preetpatel/Qwen3.8-27B-Uncensored-NVFP4 /mnt/models/preetpatel/; mv /mnt/models/.incoming/orcarouter/Qwen3.8-27B-Uncensored-FP8 /mnt/models/orcarouter/; rmdir /mnt/models/.incoming/preetpatel /mnt/models/.incoming/orcarouter /mnt/models/.incoming; df -h /mnt/models'
+~~~
+
 ### 安装 384 GiB KV 缓存自动清理
 
 将仓库里的清理器与 systemd unit 复制到 PVE host，再用 `pct push` 放进 CT。清理器每 15 秒扫描 `.bin` KV 块；超过 384 GiB 时按最旧优先删除到 90% 水位（约 345.6 GiB）。它只作用于 `/mnt/kv-cache` 挂载，并拒绝在挂载缺失时运行。
@@ -341,6 +393,8 @@ ModelScope 模型页：[incoai/Qwen3.8-27B-DFlash2](https://www.modelscope.cn/mo
 
 建立本地 profile：
 
+上游 route profile 只接受下列路由字段。模型目录、GPU 选择、服务端口和缓存目录等运行参数要在启动时通过 `--set` 传入，不要追加到这个 profile 文件，否则 launcher 会拒绝不支持的 profile key。
+
 ~~~bash
 mkdir -p /etc/vllm-lab/profiles
 cat > /etc/vllm-lab/profiles/nvfp4-dflash2-200k-3-image.env <<'EOF'
@@ -355,17 +409,6 @@ MAX_NUM_SEQS=3
 SPECULATIVE_METHOD=dflash
 SPECULATIVE_TOKENS=7
 MESSAGE_TYPE=text+image
-MODEL_DIR=/mnt/models/preetpatel/Qwen3.8-27B-Uncensored-NVFP4
-SPECULATIVE_MODEL=/mnt/models/preetpatel/Qwen3.8-27B-DFlash2
-SERVED_NAME=Qwen3.8-27B
-TP_SIZE=4
-GPU_DEVICES=0,1,2,3
-KV_DISK_CACHE_DIR=/mnt/kv-cache
-KV_DISK_CPU_BYTES=8589934592
-MM_IMAGE_LIMIT=4
-MM_LIMIT_JSON='{"image":4,"video":0,"audio":0}'
-SERVICE_SCOPE=lan
-PORT=8000
 EOF
 ~~~
 
@@ -414,7 +457,6 @@ chmod 0755 /usr/local/bin/vllm-lab
   --set KV_DISK_CACHE_DIR=/mnt/kv-cache \
   --set KV_DISK_CPU_BYTES=8589934592 \
   --set MM_IMAGE_LIMIT=4 \
-  --set 'MM_LIMIT_JSON={"image":4,"video":0,"audio":0}' \
   --set SERVICE_SCOPE=lan \
   --set PORT=8000 \
   --non-interactive
@@ -429,18 +471,31 @@ chmod 0755 /usr/local/bin/vllm-lab
 ~~~bash
 test -f /mnt/models/preetpatel/Qwen3.8-27B-Uncensored-NVFP4/config.json
 test -f /mnt/models/preetpatel/Qwen3.8-27B-Uncensored-NVFP4/model.safetensors
+test -f /mnt/models/orcarouter/Qwen3.8-27B-Uncensored-FP8/model.safetensors.index.json
 test -f /mnt/models/preetpatel/Qwen3.8-27B-DFlash2/model.safetensors
-/usr/local/bin/vllm-lab --profile nvfp4-dflash2-200k-3-image --non-interactive
+/usr/local/bin/vllm-lab \
+  --profile nvfp4-dflash2-200k-3-image \
+  --set MODEL_DIR=/mnt/models/preetpatel/Qwen3.8-27B-Uncensored-NVFP4 \
+  --set SPECULATIVE_MODEL=/mnt/models/preetpatel/Qwen3.8-27B-DFlash2 \
+  --set SERVED_NAME=Qwen3.8-27B \
+  --set TP_SIZE=4 \
+  --set GPU_DEVICES=0,1,2,3 \
+  --set KV_DISK_CACHE_DIR=/mnt/kv-cache \
+  --set KV_DISK_CPU_BYTES=8589934592 \
+  --set MM_IMAGE_LIMIT=4 \
+  --set SERVICE_SCOPE=lan \
+  --set PORT=8000 \
+  --non-interactive
 ~~~
 
-启动器应输出 GPU KV cache tokens ≥ 600,000，并给出 KV concurrency check: OK。重装前同一 2048 batch-token 配置实测 670,491；本次主模型尚未加载，因此需重新确认。随后检查 API 与显卡：
+启动器应输出 GPU KV cache tokens ≥ 600,000，并给出 KV concurrency check: OK。本次首次启动得到 670,491 tokens（≥ 3 × 200,000），Health check 和 smoke test 通过。随后检查 API 与显卡：
 
 ~~~bash
 curl -fsS http://127.0.0.1:8000/v1/models
 nvidia-smi
 ~~~
 
-/v1/models 必须报告 served model Qwen3.8-27B 和 `max_model_len: 200000`。启动器的 smoke check 和 4K/128、32K/512 基准可以验证基本推理；图像与三路并发请求需另行发送验证。重装前的旧部署曾通过 smoke、三路短请求、图像请求与上下文检查；这些结果不替代本次恢复模型后的验收。
+/v1/models 报告 served model `Qwen3.8-27B` 和 `max_model_len: 200000`。本次三路并发短请求均返回成功；图像请求实际处理约 3,003 个 image tokens，关闭本次请求的 thinking 后在 256 输出 tokens 内返回了描述。完整模型首启会编译 CUDA/FlashInfer 内核，可能需要数分钟。
 
 验收结束后，使用 wrapper 菜单 9. Stop service 停止服务并确认。确认 host 上四张卡回到 P8、显存 0，再清理测试产生的 disk KV checkpoint 和 /dev/shm/vllm_offload_*.mmap 临时文件。JIT 编译缓存留在上游 checkout 中。当前服务默认保持停止；LAN API 地址为 http://10.10.2.100:8000/v1。
 
@@ -448,7 +503,7 @@ nvidia-smi
 
 重装前的旧部署曾通过 smoke test、三路并发、图像输入与上下文检查，验收后 API 服务停止、测试 KV 文件清理。旧 CT101 与旧快照未导出，重装后不存在。
 
-本次 host/CT/P2P/P8、Toolkit、vLLM build、DFlash2 下载和 KV 自动清理器均已完成。API 服务保持停止；目前只缺用户本地上传的 NVFP4/FP8 主模型权重。恢复后再验证实际模型加载、Harness 的 200k 上下文报告、图片请求、三路并发及完整 smoke test。
+本次 host/CT/P2P/P8、Toolkit、vLLM build、三个模型、384 GiB KV 清理器和实际模型启动验收均已完成。Health、smoke、三路并发、200k 上下文报告与图片请求都通过。API 已按要求停止；需要提供服务时，从 CT 菜单选择 8 启动。
 
 ## 参考链接
 

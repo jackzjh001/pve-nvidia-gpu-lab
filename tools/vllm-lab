@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+mkdir -p /mnt/vllm/cache/vllm /mnt/vllm/cache/xdg /mnt/vllm/cache/torch \
+  /mnt/vllm/cache/inductor /mnt/vllm/cache/triton /mnt/vllm/cache/flashinfer \
+  /mnt/vllm/cache/pycache /mnt/vllm/cache/torch-extensions /mnt/vllm/tmp \
+  /mnt/vllm/logs/launcher
+
+export RUNTIME_ROOT=/mnt/vllm/runtime
+export PROFILE_DIR=/etc/vllm-lab/profiles
+export LOG_DIR=/mnt/vllm/logs/launcher
+export STATE_FILE=/mnt/vllm/runtime/launcher-state.env
+export VLLM_CACHE_ROOT=/mnt/vllm/cache/vllm
+export FLASHQLA_ROOT=/mnt/vllm/deps/FlashQLA-SM70-SM75
+export TORCH_EXTENSIONS_DIR=/mnt/vllm/cache/torch-extensions
+export XDG_CACHE_HOME=/mnt/vllm/cache/xdg
+export TORCH_HOME=/mnt/vllm/cache/torch
+export TORCHINDUCTOR_CACHE_DIR=/mnt/vllm/cache/inductor
+export TRITON_CACHE_DIR=/mnt/vllm/cache/triton
+export FLASHINFER_WORKSPACE_BASE=/mnt/vllm/cache/flashinfer
+export PYTHONPYCACHEPREFIX=/mnt/vllm/cache/pycache
+export TMPDIR=/mnt/vllm/tmp
+export CUDA_HOME=/usr/local/cuda-13.5
+export PATH=/usr/local/cuda-13.5/bin:/mnt/vllm/runtime/.venv/bin:/usr/local/bin:/usr/bin:/bin
+export PYTHONHASHSEED=0
+
+exec /mnt/vllm/vLLM-2080Ti-Definitive/launcher.sh "$@"

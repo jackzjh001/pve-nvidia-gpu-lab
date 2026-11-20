@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: Apache-2.0
+[Unit]
+Description=Prune vLLM disk KV cache to its configured size limit
+ConditionPathIsMountPoint=/mnt/kv-cache
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/default/vllm-kv-cache-prune
+ExecStart=/usr/local/sbin/vllm-kv-cache-prune
+Nice=19
+IOSchedulingClass=idle

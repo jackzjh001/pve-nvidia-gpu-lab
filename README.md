@@ -4,7 +4,7 @@
 
 配套脚本：[deploy-pve-gpu-lab.sh](./deploy-pve-gpu-lab.sh)
 
-CT100 的模型、磁盘布局、vLLM 构建和启动配置另见[完整恢复记录](./CT100-REDEPLOYMENT.md)。PVE 刚重装完，host 部署和 GPU 验证已完成；CT 尚未重建，因为当前 `local-lvm` 容量不足以容纳原定的 400 GiB KV cache、CT 系统盘和 vLLM runtime。
+CT100 的模型、磁盘布局、vLLM 构建和启动配置另见[完整恢复记录](./CT100-REDEPLOYMENT.md)。PVE host、CT100、GPU 映射、CUDA Toolkit 和上游 vLLM runtime 已重建；vLLM 服务保持停止，等待重新提供本地 NVFP4/FP8 主模型权重。
 
 ## 当前状态快照
 
@@ -22,12 +22,15 @@ CT100 的模型、磁盘布局、vLLM 构建和启动配置另见[完整恢复�
 | P2P 修正 | `pex8796-gpu-p2p.service` 开机时沿 GPU 的 sysfs 父级关系发现 PEX8796，清除对应 ACS 控制位 |
 | 省电 | `nvidia-pstated` 正常运行；持有约 263 MiB 显存、无计算时 GPU0 回到 P8；四卡空闲均为 P8 |
 | 命令 | `/usr/local/bin/gpu-lab`，提供 `power`、`bench`、`ct` 子命令 |
-| CT | PVE 重装后尚未重建；Ubuntu 26.04 模板已下载到 `local` |
-| 存储 | 模板在 `local`；CT 系统卷、vLLM、KV cache 预期在 `local-lvm`；`xg3` 仅用于模型和备份 |
+| CT | CT100 Ubuntu 26.04 正在运行并设为 host 开机自启；rootfs 32 GiB 在 `local`，静态地址 `10.10.2.100`；四卡 NVIDIA 设备已映射 |
+| 存储 | `/mnt/vllm` Samsung 32 GiB；`/mnt/kv-cache` Samsung 400 GiB 卷（`df` 可用约 393 GiB）、384 GiB 缓存上限；`/mnt/models` Toshiba 200 GiB |
+| vLLM | 上游 `vLLM-2080Ti-Definitive` 固定 commit 已构建；PyTorch 2.13.0+cu130，4×SM75，FlashQLA 扩展通过构建自检 |
+| 模型与服务 | DFlash2 已从 ModelScope 下载；NVFP4/FP8 主模型尚未恢复；API 服务未启动 |
+| KV 清理 | CT 内 `vllm-kv-cache-prune.timer` 每 15 秒检查；超过 384 GiB 后按最旧 `.bin` 块回收到 90% 水位 |
 
 本次在 host 验证：`nvidia-smi topo -p2p p` 的所有 GPU 对均为 `OK`；nvbandwidth 的 GPU-to-GPU 单向 copy-engine 带宽约 6.57–6.67 GB/s，双向合计约 12.5 GB/s；SM 读/写约 6.67/5.53 GB/s。四卡 NCCL all-reduce 在 8 MiB–1 GiB 测试范围内完成，平均 bus bandwidth 5.45 GB/s，数据校验错误为 0。PCIe 测试期间服务会暂停，测试后已恢复；四卡空闲重新回到 P8。
 
-当前实测存储容量：`local-lvm` thin pool 约 293 GiB；CT rootfs 16 GiB、vLLM 80 GiB 和 KV cache 400 GiB 合计至少需要 496 GiB，不能安全分配。新 `xg3` 是独立 ext4 盘（挂载 `/mnt/pve/xg3`，约 466 GiB 可用），目前没有模型文件；已创建 `/mnt/pve/xg3/models` 并将 PVE 存储内容限制为 `backup`。不应通过 thin pool 超额分配伪造 400 GiB 上限，因为实际写满点会早于 KV 目录容量。
+Samsung 与 Toshiba 是独立 ext4 文件系统，无 RAID。PVE `local` 存放 CT rootfs 和模板；`samsung` 存放 vLLM、KV 卷与现存 swap；`toshiba` 存放模型。KV 卷创建为 400 GiB，ext4 扩展到完整卷并关闭 5% root 保留块，给 384 GiB 清理阈值留出文件系统余量。KV 定时清理器单独作为系统服务部署，未改动上游 vLLM 仓库。
 
 ## 自动部署
 
